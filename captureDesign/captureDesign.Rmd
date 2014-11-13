@@ -1,0 +1,113 @@
+---
+title: "captureDesign"
+author: "Christian Parobek"
+date: "10/09/2014"
+output: html_document
+---
+
+This is an R-markdown document (.Rmd) that will let me string together multiple programs to achieve my end goal.
+
+This document describes steps to identify the SNPs for our SureSelect hybrid capture array. Since it's _so expensive_ ;), I want to make sure we're doing things correctly. This script picks up after variant calling with GATK's Unified Genotyper (diploid style) and after Neafsey's Paralogs and `Tandem Repeat Finder` filtering.
+
+```{r, engine='bash', echo=FALSE}
+## REMOVE ALL THE HEADER LINES FROM THE ORIGINAL VCF
+grep -v "^#" preCQ.filtered.vcf > origSNPs.txt
+```
+
+```{r, echo=FALSE}
+## NOW, READ THE ORIGINAL VCF INTO R
+origSNPs <- read.table("origSNPs.txt", header=FALSE)
+```
+
+It appears there are **`r length(origSNPs$V1)` SNPs** in our VCF file. We're not sure whether they're distributed evenly across the chromosomes (when adjusted for lenth), but lets go ahead and filter some more to see what we get. Which SNP filters should we apply? The ones I've experimented with so far are the Minor Allele Frequency and Thinning parameter (i.e. removing neighboring SNPs that are too close).
+
+```{r, engine='bash', echo=FALSE}
+## THIS CODE SHOULD BE EXECUTED IN SAME DIRECTORY AS VCF FILE
+## FILTERING FOR SNPs WITH MAF > 0.1, AND THAT ARE > XX BPs APART AND HAVE QUAL < 200
+vcftools \
+  --vcf preCQ.filtered.vcf \
+  --maf 0.1 \
+	--thin 70 \
+  --minQ 200 \
+	--out preCQ_maf_thin \
+	--recode
+
+## WHILE WE'RE AT IT, GET JUST THE SNPS THAT WERE FILTERED 
+bedtools subtract -a preCQ.filtered.vcf -b preCQ_maf_thin.recode.vcf > removedSNPs.txt
+
+## AND GET JUST THE SNPS THAT WERE KEPT
+grep -v "^#" preCQ_maf_thin.recode.vcf > remainingSNPs.txt
+```
+
+In the output above, we can see just how many SNPs we started with and how many we're left with after filtering for MAF and thinning. It'll be important to make sure that we're not experiencing significant chromosome-level biases in the distribution of our SNPs that pass or fail our filters. Below, I'm plotting the original SNPs per chromosome (red dots), the number of SNPs culled from each chromosome (vertical red line), and the number of SNPs remaining after filtering (black dot).
+
+```{r, echo=FALSE}
+## READ IN CHR LENS SO I CAN SEE IF FILTERING IS APPLIED EVENLY ACROSS CHRS
+chrLens <- read.table("chrLens.txt", header=TRUE)
+
+## AGGREGATE, MERGE, AND ORDER ORIGINAL VCF BY CHROMOSOME
+origAgg <- aggregate(origSNPs, by=list(origSNPs$V1), FUN=length)[1:2]
+origCorr <- merge(origAgg, chrLens, by.x="Group.1", by.y="chrs")
+orig <- origCorr[with(origCorr, order(origCorr$lens)),]
+
+## READ IN, AGGREGATE, MERGE, AND ORDER THE FILTERED-OUT VCF, JUST THE FIRST TWO COLUMNS
+removSNPs <- read.table("removedSNPs.txt")
+removAgg <- aggregate(removSNPs, by=list(removSNPs$V1), FUN=length)[1:2]
+removCorr <- merge(removAgg, chrLens, by.x="Group.1", by.y="chrs")
+remov <- removCorr[with(removCorr, order(removCorr$lens)),]
+
+## READ IN, AGGREGATE, MERGE, AND ORDER (FOR GRAPHING) THE KEPT-SNP VCF FILE
+keptSnps <- read.table("remainingSNPs.txt")
+keptAgg <- aggregate(keptSnps, by=list(keptSnps$V1), FUN=length)[1:2]
+keptCorr <- merge(keptAgg, chrLens, by.x="Group.1", by.y="chrs")
+kept <- keptCorr[with(keptCorr, order(keptCorr$lens)),]
+
+## ADD A LINEAR MODEL
+lm <- lm(lens ~ V1, data=kept)
+
+```
+
+```{r, echo=FALSE}
+## PLOT IT
+library(ggplot2)
+library(grid) ## for the arrow
+qplot(lens, V1, data=kept, 
+      xlab="Chromosome Length", 
+      ylab="Number of SNP", 
+      main="SNPs Per Chromosone in MAF-Filtered and Thinned VCF", size=6) +
+  geom_point(data=orig, aes(lens, V1), color="red", size=2) +
+  geom_segment(data=remov, aes(x = kept$lens, y = orig$V1, xend = kept$lens, yend = kept$V1 + 75), color="red", size=0.5, arrow=arrow(length=unit(0.2,"cm"))) + 
+  theme(legend.position="none")
+```
+
+It is clear that our original SNP-by-chromosome distribution is biased somehow (... the R2 value of the red dots would be low). Additionally, the per-chromosome MAF and thinning filtering does not remove SNPs in proportion to chromosome length. However, after SNP filtering, you can see we have a pretty fair SNP-per-chromosome distribution (the R2 value of the black dots would be high).
+
+It is easy to experiment with the MAF and thinning parameters, if you'd like to explore other options.
+
+Right now, it looks like we're at about 1 SNP every 1000 bps. 
+
+Now we're ready to go ahead and design the baits. Let's choose the 60 bases prior to a SNP and the 59 bases following. But remember that the first base on a BED chromosome is 0 and the end base is 1-based. So begin=9 end=20 spans bases 10-20, inclusive.  Since VCF format is 1-based, so I need to subtract 1 from the start and end locations to actually get the coordinates right.
+
+The output BED file is called "crossBaits.bed".
+
+```{r, echo=FALSE}
+## GRAB THE CHROMOSOME, BEGIN SITE, AND END SITE FOR EACH SNP
+## REMEMBER FIRST BASE ON CHR IS 0, BUT END IS 1-BASED FOR A BED FILE
+bed <- keptSnps[,1:2] # remove 
+bed$begin <- bed$V2 - 60 - 1 # add the begin column, which is 0-based
+bed$end <- bed$V2 + 59 # add the end column, which is 1-based
+bed <- bed[-2] # remove column V2
+names(bed)[1] <- "chr" # rename column 1
+
+# REMOVE ANY ROWS WITH A begin VALUE OF <0
+bed <- bed[-bed$begin < 0,]
+
+## WRITE TABLE
+write.table(bed, file="crossBaits.bed", quote=FALSE, sep="\t", row.names=FALSE, col.names=FALSE)
+```
+
+Now take that BED file and output a FASTA file of those intervals using `bedtools getfasta`... outputting to "crossBaits.fasta".
+```{r, engine='bash', echo=FALSE}
+bedtools getfasta -fi PlasmoDB-10.0_PvivaxSal1_Genome.fasta -bed crossBaits.bed -fo crossBaits.fasta
+```
+

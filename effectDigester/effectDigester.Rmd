@@ -1,0 +1,132 @@
+---
+title: "effectDigester"
+author: "Christian Parobek"
+date: "10/21/2014"
+output: html_document
+---
+
+This is an R-markdown document (.Rmd) that will let me string together multiple programs to achieve my end goal.
+
+I want a reproducible way to integrate Cross variant calls with reference strain variant calls (AMRU, Chesson, Indo) without having to use Excel. What I've written has the ability to generate snpEff effects for multiple VCF files, though I'm just doing it for the cross variants at the moment.
+
+To start out, I need individual prefiltered (for Neafsey and TRF) VCF files of the cross (`-ploidy 2`), the three reference strains (`-ploidy 1`), and the #27 Resistant cross monkey-blood draw (aka Cap13-Idx5). I'm applying no quality filering to these, though I will visually curate my list of variant calls in the end using IGV.
+
+First, cut down the VCFs to just the region of interest using `vcftools`:
+```{r, engine='bash', results='hide',cache=TRUE}
+for name in "preCQ" "amru" "chesson" "indo"
+do
+    ## select only variants 
+    vcftools \
+      --vcf $name.vcf \
+    	--chr Pv_Sal1_chr01 \
+    	--from-bp 328920 \
+    	--to-bp 364607 \
+    	--out $name \
+    	--recode
+done
+```
+
+Next, annontate the SNPs in each of the files using `snpEff`:
+```{r, engine='bash', results='hide', cache=TRUE}
+for name in "preCQ" "amru" "chesson" "indo"
+do
+
+    ## clean up the recoded files to include only properly formatted variant entries
+    grep "^Pv" $name.recode.vcf > $name.clean.vcf
+
+    ## annotate the SNPs in each of the file
+    java -Xmx4g -jar snpEff.jar -v Pvivax $name.clean.vcf | grep -v "SOMETHING" | cut -f 8 > $name.eff.txt
+
+done
+```
+
+Next, use `python` to prioritize the importance of effects. I'm using NON_SYN > SYN > INTRON > MODIFIER:
+```{r, engine='python'}
+## Import libraries
+import re
+
+## Define VCF names
+names=['preCQ', 'amru',  'chesson', 'indo']
+
+## Iterate through each filename
+for name in names:
+
+## Open IN and OUT files
+  effects=open(name+'.eff.txt',"r")
+  output=open(name+'.py.txt', "wa")
+
+## Using an iterator to read through each line
+  for line in iter(effects):
+    if re.search('NON_SYNONYMOUS.*?\)', line) is not None:
+      output.write(re.search('NON_SYN.*?\)', line).group())
+      output.write("\n")
+    elif re.search('SYNONYMOUS.*?\)', line) is not None:
+      output.write(re.search('SYNONYMOUS.*?\)', line).group())
+      output.write("\n")
+    elif re.search('INTRON.*?\)', line) is not None:
+      output.write(re.search('INTRON.*?\)', line).group())
+      output.write("\n")
+    elif re.search('DOWNSTREAM.*?\)', line) is not None:
+      output.write(re.search('DOWNSTREAM.*?\)', line).group())
+      output.write("\n")
+
+```
+
+Now clean up the output and paste it all together into one file for reading into `R`.
+```{r, engine='bash'}
+## Paste VCF file with the effect information together and select relevant columns
+paste amru.clean.vcf amru.py.txt | awk -F '\t' 'BEGIN {OFS=FS} {print $2,$5}' > amru.var.txt
+paste chesson.clean.vcf chesson.py.txt | awk -F '\t' 'BEGIN {OFS=FS} {print $2,$5}' > chesson.var.txt
+paste indo.clean.vcf indo.py.txt | awk -F '\t' 'BEGIN {OFS=FS} {print $2,$5}' > indo.var.txt
+paste preCQ.clean.vcf preCQ.py.txt | awk -F '\t' 'BEGIN {OFS=FS} {print $2,$1,$4,$5,$6,$20}' > preCQ.var.txt
+
+## Remove intermediate files
+rm *.py.txt
+
+## Now, concatenate all the files together
+#cat amru.var.txt chesson.var.txt indo.var.txt preCQ.var.txt > allVariants.txt
+```
+
+Read the data into R, collapse on position, combine strains that are variant at any given position. I also want to compare these genotypes to the resistant strain that went into the cross. Blood draws #27 and #28 look essentially identical... even though #27 we thought was Resistant. But we're sure that #28 is CQR, because it was drawn after several rounds of CQ treatment.
+
+```{r}
+library(data.table)
+
+## Read in the "effected" VCF tables
+amru <- read.table("amru.var.txt", header=FALSE, comment.char="#")
+chesson <- read.table("chesson.var.txt", header=FALSE, comment.char="#")
+indo <- read.table("indo.var.txt", header=FALSE, comment.char="#")
+preCQ <- read.table("preCQ.var.txt", header=FALSE, comment.char="#")
+resis <- read.table("CQ_Capture_14-Index6_GCCAAT.realn.bam.filtered.vcf", comment.char="#")
+
+## Merge Ref Strain VCFs onto the preCQ VCF
+preCQ <- merge(preCQ, amru, by=c("V1"), all.x=TRUE)
+setnames(preCQ, "V2.y", "AMRU")
+preCQ <- merge(preCQ, chesson, by=c("V1"), all.x=TRUE)
+setnames(preCQ, "V2", "Chesson")
+preCQ <- merge(preCQ, indo, by=c("V1"), all.x=TRUE)
+setnames(preCQ, "V2", "Indo")
+
+## Rename preCQ columns
+setnames(preCQ, c("V1","V2.x","V3","V4","V6"), c("Position","Chromosome","Sal1Ref","Variant","Effect_of_non-Sal1_allele"))
+preCQ$V5 <- NULL # Get rid of quality scores for preCQ VCF variant calling
+
+## Merge cross-Resistant strain VCF onto preCQ VCF
+resis <- resis[resis$V1 == "Pv_Sal1_chr01",] # select only chr01
+resis <- resis[,c("V2","V5")]
+setnames(resis, c("V2","V5"), c("Position","ResistantParent"))
+preCQ <- merge(preCQ, resis, by=c("Position"), all.x=TRUE)
+
+## Determine which alleles are cross-Resistant and which are cross-Sensitive
+preCQ[is.na(preCQ$ResistantParent),]$ResistantParent <- preCQ[is.na(preCQ$ResistantParent),]$Sal1Ref
+  # assign the Sal1 base call to all ResistantParent == <NA>
+preCQ$SensitiveParent[preCQ$Sal1Ref == preCQ$ResistantParent] <- as.character(preCQ$Variant[preCQ$Sal1Ref == preCQ$ResistantParent])
+  # assign the Variant base call to all SensitiveParent calls where ResistantParent == Sal1Ref
+preCQ$SensitiveParent[preCQ$Sal1Ref != preCQ$ResistantParent] <- as.character(preCQ$Sal1Ref[preCQ$Sal1Ref != preCQ$ResistantParent])
+
+## Rearrange the data table
+preCQ <- preCQ[,c("Chromosome","Position","Sal1Ref","ResistantParent","SensitiveParent","AMRU","Chesson","Indo","Effect_of_non-Sal1_allele")]
+
+## Print the dataframe
+write.table(preCQ, file = "variants.txt", quote=FALSE, row.names=FALSE, sep="\t")
+```
